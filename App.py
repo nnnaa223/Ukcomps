@@ -31,6 +31,10 @@ def mark_as_clicked(comp_id):
     if supabase:
         supabase.table("competitions").update({"clicked": True}).eq("id", comp_id).execute()
 
+def mark_as_dismissed(comp_id):
+    if supabase:
+        supabase.table("competitions").update({"dismissed": True}).eq("id", comp_id).execute()
+
 # --- 3. HARD EXCLUSIONS & FORM-VALIDATION ENGINE ---
 def is_valid_competition_entry(url, title):
     """
@@ -67,7 +71,7 @@ def is_valid_competition_entry(url, title):
     if not any(term in text_lower for term in active_intent_terms):
         return False
 
-    # E. CHECK YEAR AGE (Drop anything referencing previous years in title)
+    # E. CHECK YEAR AGE
     current_year = datetime.date.today().year
     past_years = [str(y) for y in range(2020, current_year)]
     if any(year in title for year in past_years):
@@ -92,17 +96,16 @@ def is_valid_competition_entry(url, title):
         if any(signal in page_text for signal in closed_signals):
             return False
 
-        # Additional text check for lead-gen traps in page content
         if any(trap in page_text for trap in ["complete survey to enter", "purchase necessary", "£ per entry"]):
             return False
 
-        # Form presence check: Ensure HTML contains an actual form, input field, or widget iframe
+        # Form presence check
         has_form = bool(soup.find("form"))
         has_input = bool(soup.find("input", {"type": re.compile(r"email|text|submit|radio|checkbox", re.I)}))
         has_widget = any(w in resp.text.lower() for w in ["gleam.io", "rafflecopter", "promosimple", "iframe", "glisser"])
 
         if not (has_form or has_input or has_widget):
-            return False  # Drop pages without an entry mechanism
+            return False
 
         return True
     except Exception:
@@ -110,17 +113,10 @@ def is_valid_competition_entry(url, title):
 
 # --- 4. HIGH-PROBABILITY HEURISTIC SCORING ENGINE ---
 def calculate_score(title, url):
-    """
-    Ranks probability:
-    + Boosts niche UK sites, independent blogs, local domains, and tight deadlines.
-    + Boosts embedded entry widgets (Gleam/Rafflecopter).
-    - Penalizes high-traffic national brands and mandatory media/tagging requirements.
-    """
     score = 70.0
     text_lower = title.lower()
     url_lower = url.lower()
 
-    # --- BOOSTS (Niche / Low Traffic / High Probability) ---
     if any(k in url_lower for k in [".co.uk/blog", "wordpress", "blogspot", "local", "independent"]):
         score += 25.0
 
@@ -133,7 +129,6 @@ def calculate_score(title, url):
     if any(k in text_lower for k in ["closes today", "ends tonight", "24 hours left", "ends tomorrow", "quick enter"]):
         score += 20.0
 
-    # --- PENALTIES ---
     if any(k in text_lower for k in ["tag a friend", "tag 3 friends", "upload photo", "submit video", "instagram"]):
         score -= 50.0
 
@@ -179,7 +174,6 @@ def fetch_competitions():
                     link = item.find("link").text if item.find("link") else ""
                     
                     if link and not any(social in link.lower() for social in ["x.com", "twitter.com", "instagram.com", "facebook.com", "tiktok.com"]):
-                        # Screen for live forms, remove paywalls/traps/articles
                         if is_valid_competition_entry(link, title):
                             score = calculate_score(title, link)
                             if score >= 30.0:
@@ -194,7 +188,6 @@ def fetch_competitions():
         except Exception:
             pass
 
-    # UPSERT TO SUPABASE DB
     for comp in new_comps:
         try:
             supabase.table("competitions").upsert(comp, on_conflict="url").execute()
@@ -202,8 +195,21 @@ def fetch_competitions():
             pass
 
 # --- 6. USER INTERFACE ---
-st.title("🏆 UK High-Probability Competition Finder")
-st.caption("Filters out paywalls, quote traps, articles, and pages without active entry forms.")
+header_col1, header_col2 = st.columns([3, 1])
+
+with header_col1:
+    st.title("🏆 UK High-Probability Competition Finder")
+    st.caption("Filters out paywalls, quote traps, articles, and pages without active entry forms.")
+
+with header_col2:
+    completed_count = 0
+    if supabase:
+        try:
+            res = supabase.table("competitions").select("id", count="exact").eq("clicked", True).execute()
+            completed_count = res.count if res.count is not None else len(res.data)
+        except Exception:
+            completed_count = 0
+    st.metric(label="✅ Completed Comps", value=completed_count)
 
 if not supabase:
     st.warning("⚠️ Database connection missing. Check Streamlit Cloud Settings -> Secrets.")
@@ -216,7 +222,8 @@ else:
             st.rerun()
 
     try:
-        response = supabase.table("competitions").select("*").eq("clicked", False).order("visibility_score", desc=True).execute()
+        # Fetch only competitions that are NEITHER clicked NOR dismissed
+        response = supabase.table("competitions").select("*").eq("clicked", False).or_("dismissed.is.null,dismissed.eq.false").order("visibility_score", desc=True).execute()
         data = response.data
     except Exception as e:
         st.error(f"Error querying Supabase: {e}")
@@ -232,11 +239,15 @@ else:
             closing_text = f" | ⏳ **Closing:** {row['closing_date']}" if row['closing_date'] != "Not Specified" else ""
             st.caption(f"Score: **{int(row['visibility_score'])} pts** | Added: {row['date_added']}{closing_text}")
             
-            col1, col2 = st.columns([1, 1])
+            col1, col2, col3 = st.columns([2, 1, 1])
             with col1:
-                st.markdown(f'<a href="{row["url"]}" target="_blank"><button style="width:100%; padding: 10px; background-color: #4CAF50; color: white; border: none; border-radius: 5px; font-size:16px;">Open Competition ↗</button></a>', unsafe_allow_html=True)
+                st.markdown(f'<a href="{row["url"]}" target="_blank"><button style="width:100%; padding: 8px; background-color: #4CAF50; color: white; border: none; border-radius: 5px; font-size:15px; cursor:pointer;">Open Competition ↗</button></a>', unsafe_allow_html=True)
             with col2:
-                if st.button("Mark Completed ✅", key=f"btn_{row['id']}"):
+                if st.button("Completed ✅", key=f"btn_complete_{row['id']}", use_container_width=True):
                     mark_as_clicked(row['id'])
+                    st.rerun()
+            with col3:
+                if st.button("Not Interested ❌", key=f"btn_dismiss_{row['id']}", use_container_width=True):
+                    mark_as_dismissed(row['id'])
                     st.rerun()
             st.divider()
