@@ -1,53 +1,19 @@
-import streamlit as st
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-import datetime
-import time
-import urllib.parse
-import re
-import imaplib
-import email
-from email.header import decode_header
-from supabase import create_client, Client
-
-# --- SUPABASE INIT ---
-@st.cache_resource
-def init_supabase() -> Client:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
-
-supabase = init_supabase()
-
-def mark_as_clicked(comp_id):
-    supabase.table("competitions").update({"clicked": True}).eq("id", comp_id).execute()
-
-# --- VALIDATION ENGINE (DEAD & CLOSED LINKS) ---
-def is_link_valid(url):
-    """Verifies link returns 200 OK and is not marked as closed on page."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=5)
-        if resp.status_code != 200:
-            return False
-        
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        page_text = soup.get_text().lower()
-        
-        closed_signals = ["competition closed", "winner has been contacted", "no longer accepting entries", "giveaway ended"]
-        for signal in closed_signals:
-            if signal in page_text:
-                return False
-        return True
-    except Exception:
-        return False
-
 # --- HEURISTIC SCORE ENGINE ---
 def calculate_score(title, source):
     """Calculates visibility & odds score based on user requirements."""
     score = 80.0
     text_lower = title.lower()
+
+    # ALCOHOL FILTER: Instantly drop score to 0 to exclude alcohol prizes
+    alcohol_terms = [
+        "wine", "beer", "gin", "whisky", "whiskey", "vodka", "rum", 
+        "prosecco", "champagne", "cider", "ale", "brewery", "distillery", 
+        "cocktail", "liquor", "spirits", "bottle of", "booze", "IPA"
+    ]
+    for term in alcohol_terms:
+        # Use word boundaries via regex so "cabinet" or "ginger" aren't accidentally flagged
+        if re.search(r'\b' + re.escape(term) + r'\b', text_lower):
+            return 0.0
 
     # NO. 2 PENALTIES: Avoid photo uploads or mandatory friend tagging
     avoid_terms = ["tag a friend", "tag 3 friends", "tag your friends", "upload a photo", "submit a video", "picture entry"]
@@ -69,155 +35,3 @@ def calculate_score(title, source):
             score -= 30.0
 
     return max(score, 0.0)
-
-def extract_closing_date(text):
-    match = re.search(r'(closes|ending|ends|entry by)\s*(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+|\d{1,2}/\d{1,2})', text, re.IGNORECASE)
-    return match.group(0) if match else "Not Specified"
-
-# --- SCRAPING & INGESTION ENGINES ---
-def fetch_competitions():
-    new_comps = []
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-    # 1. LOCAL & REGIONAL BUSINESS ENGINE
-    local_queries = [
-        'site:.co.uk "win" "giveaway" ("London" OR "Manchester" OR "Birmingham" OR "Yorkshire")',
-        'site:.co.uk "competition" ("local business" OR "independent shop") "win"'
-    ]
-    
-    for query in local_queries:
-        encoded_query = urllib.parse.quote(query)
-        google_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-GB&gl=GB&ceid=GB:en"
-        try:
-            resp = requests.get(google_url, headers=headers, timeout=8)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.content, "xml")
-                for item in soup.find_all("item")[:8]:
-                    title = item.find("title").text if item.find("title") else "Local UK Giveaway"
-                    link = item.find("link").text if item.find("link") else ""
-                    if link and is_link_valid(link):
-                        score = calculate_score(title, "Local Business UK")
-                        new_comps.append({
-                            "title": f"📍 {title.strip()}",
-                            "url": link.strip(),
-                            "source": "Local Business UK",
-                            "visibility_score": score,
-                            "date_added": datetime.date.today().isoformat(),
-                            "closing_date": extract_closing_date(title)
-                        })
-        except Exception:
-            pass
-
-    # 2. X & INSTAGRAM ENGINES
-    social_queries = [
-        ('site:x.com "uk giveaway" OR "win" "retweet" "uk only"', "X (Twitter)", "𝕏: "),
-        ('site:instagram.com/p/ "uk giveaway" OR "win" "uk only"', "Instagram", "📸 IG: ")
-    ]
-
-    for query, source_label, prefix in social_queries:
-        encoded_query = urllib.parse.quote(query)
-        google_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-GB&gl=GB&ceid=GB:en"
-        try:
-            resp = requests.get(google_url, headers=headers, timeout=8)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.content, "xml")
-                for item in soup.find_all("item")[:8]:
-                    title = item.find("title").text if item.find("title") else "Social Giveaway"
-                    link = item.find("link").text if item.find("link") else ""
-                    if link and is_link_valid(link):
-                        score = calculate_score(title, source_label)
-                        new_comps.append({
-                            "title": f"{prefix}{title.strip()}",
-                            "url": link.strip(),
-                            "source": source_label,
-                            "visibility_score": score,
-                            "date_added": datetime.date.today().isoformat(),
-                            "closing_date": extract_closing_date(title)
-                        })
-        except Exception:
-            pass
-
-    # 3. IMAP EMAIL INGESTION
-    if "EMAIL_USER" in st.secrets and "EMAIL_PASSWORD" in st.secrets:
-        try:
-            mail = imaplib.IMAP4_SSL(st.secrets.get("EMAIL_SERVER", "imap.gmail.com"))
-            mail.login(st.secrets["EMAIL_USER"], st.secrets["EMAIL_PASSWORD"])
-            mail.select("inbox")
-            
-            _, search_data = mail.search(None, '(UNSEEN SUBJECT "giveaway" SUBJECT "win" SUBJECT "competition")')
-            for num in search_data[0].split()[:5]:  # Process top 5 unread
-                _, msg_data = mail.fetch(num, '(RFC822)')
-                for response_part in msg_data:
-                    if isinstance(response_part, tuple):
-                        msg = email.message_from_bytes(response_part[1])
-                        subject, encoding = decode_header(msg["Subject"])[0]
-                        if isinstance(subject, bytes):
-                            subject = subject.decode(encoding or "utf-8")
-                        
-                        # Extract first HTTP URL from body
-                        body = ""
-                        if msg.is_multipart():
-                            for part in msg.walk():
-                                if part.get_content_type() == "text/plain":
-                                    body = part.get_payload(decode=True).decode()
-                        else:
-                            body = msg.get_payload(decode=True).decode()
-
-                        urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', body)
-                        if urls:
-                            target_url = urls[0]
-                            score = calculate_score(subject, "Email Subscriber")
-                            new_comps.append({
-                                "title": f"✉️ Email: {subject.strip()}",
-                                "url": target_url.strip(),
-                                "source": "Email Newsletter",
-                                "visibility_score": score + 20.0,  # Bonus for subscriber-only access
-                                "date_added": datetime.date.today().isoformat(),
-                                "closing_date": extract_closing_date(subject)
-                            })
-            mail.logout()
-        except Exception:
-            pass
-
-    # UPSERT TO SUPABASE
-    for comp in new_comps:
-        if comp["visibility_score"] > 20.0:  # Skip filtered/penalized competitions
-            try:
-                supabase.table("competitions").upsert(comp, on_conflict="url").execute()
-            except Exception:
-                pass
-
-# --- DASHBOARD UI ---
-st.set_page_config(page_title="UK Low-Entry Competition Dashboard", layout="wide")
-
-st.title("🏆 UK Low-Entry Competition Finder")
-st.caption("Filtering out tag/photo competitions. Prioritizing local, social, and email subscriber giveaways.")
-
-if st.button("🔄 Fetch & Validate Competitions Now"):
-    with st.spinner("Scouring local feeds, checking links, and scanning email inbox..."):
-        fetch_competitions()
-        st.success("Updated & Filtered!")
-        time.sleep(1)
-        st.rerun()
-
-response = supabase.table("competitions").select("*").eq("clicked", False).order("visibility_score", desc=True).execute()
-data = response.data
-
-st.subheader(f"Available High-Probability Competitions ({len(data)})")
-
-if not data:
-    st.info("No unclicked competitions available. Tap 'Fetch & Validate Competitions Now' above.")
-else:
-    for row in data:
-        st.markdown(f"### [{row['title']}]({row['url']})")
-        closing_text = f" ⏳ **Closing:** {row['closing_date']}" if row['closing_date'] != "Not Specified" else ""
-        st.caption(f"Source: **{row['source']}** | Added: {row['date_added']} | Score: **{int(row['visibility_score'])} pts**{closing_text}")
-        
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            st.markdown(f'<a href="{row["url"]}" target="_blank"><button style="width:100%; padding: 10px; background-color: #4CAF50; color: white; border: none; border-radius: 5px; font-size:16px;">Open Competition ↗</button></a>', unsafe_allow_html=True)
-        with col2:
-            if st.button("Mark Completed ✅", key=f"btn_{row['id']}"):
-                mark_as_clicked(row['id'])
-                st.rerun()
-        st.divider()
