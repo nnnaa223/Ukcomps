@@ -57,17 +57,17 @@ def calculate_score(title, source):
     score = 80.0
     text_lower = title.lower()
 
-    # NO. 2 PENALTIES: Avoid photo/media uploads or mandatory friend tagging
-    avoid_terms = ["tag a friend", "tag 3 friends", "tag your friends", "upload a photo", "submit a video", "picture entry", "upload an image"]
+    # Avoid photo/media uploads or mandatory friend tagging
+    avoid_terms = ["tag a friend", "tag 3 friends", "tag your friends", "upload a photo", "submit a video", "picture entry"]
     for term in avoid_terms:
         if term in text_lower:
             score -= 80.0
 
-    # NO. 2 BOOSTS: Short expiry and high-potential platforms
+    # Short expiry boosts
     if any(term in text_lower for term in ["closes today", "ends tonight", "24 hours left", "ends tomorrow"]):
         score += 25.0
         
-    if source in ["Instagram", "X (Twitter)", "Local Business UK"]:
+    if source in ["Instagram", "X (Twitter)"]:
         score += 20.0
 
     # High-traffic national brand penalty
@@ -82,7 +82,7 @@ def extract_closing_date(text):
     match = re.search(r'(closes|ending|ends|entry by)\s*(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+|\d{1,2}/\d{1,2})', text, re.IGNORECASE)
     return match.group(0) if match else "Not Specified"
 
-# --- SCRAPING & INGESTION ENGINES ---
+# --- SCRAPING ENGINE ---
 def fetch_competitions():
     if not supabase:
         st.error("Cannot fetch: Supabase is not connected.")
@@ -91,37 +91,7 @@ def fetch_competitions():
     new_comps = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # NO. 1 LOCAL & REGIONAL BUSINESS ENGINE
-    local_queries = [
-        'site:.co.uk "win" "giveaway" ("London" OR "Manchester" OR "Birmingham" OR "Yorkshire")',
-        'site:.co.uk "competition" ("local business" OR "independent shop") "win"'
-    ]
-    
-    for query in local_queries:
-        encoded_query = urllib.parse.quote(query)
-        google_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-GB&gl=GB&ceid=GB:en"
-        try:
-            resp = requests.get(google_url, headers=headers, timeout=8)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.content, "xml")
-                for item in soup.find_all("item")[:8]:
-                    title = item.find("title").text if item.find("title") else "Local UK Giveaway"
-                    link = item.find("link").text if item.find("link") else ""
-                    if link and is_link_valid(link):
-                        score = calculate_score(title, "Local Business UK")
-                        if score > 20.0:
-                            new_comps.append({
-                                "title": f"📍 {title.strip()}",
-                                "url": link.strip(),
-                                "source": "Local Business UK",
-                                "visibility_score": score,
-                                "date_added": datetime.date.today().isoformat(),
-                                "closing_date": extract_closing_date(title)
-                            })
-        except Exception:
-            pass
-
-    # X & INSTAGRAM ENGINES
+    # X & INSTAGRAM SEARCH FEEDS
     social_queries = [
         ('site:x.com "uk giveaway" OR "win" "retweet" "uk only"', "X (Twitter)", "𝕏: "),
         ('site:instagram.com/p/ "uk giveaway" OR "win" "uk only"', "Instagram", "📸 IG: ")
@@ -134,8 +104,8 @@ def fetch_competitions():
             resp = requests.get(google_url, headers=headers, timeout=8)
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.content, "xml")
-                for item in soup.find_all("item")[:8]:
-                    title = item.find("title").text if item.find("title") else "Social Giveaway"
+                for item in soup.find_all("item")[:10]:
+                    title = item.find("title").text if item.find("title") else "Giveaway"
                     link = item.find("link").text if item.find("link") else ""
                     if link and is_link_valid(link):
                         score = calculate_score(title, source_label)
@@ -160,13 +130,13 @@ def fetch_competitions():
 
 # --- DASHBOARD UI ---
 st.title("🏆 UK Low-Entry Competition Finder")
-st.caption("Filtering out tagging and upload requirements. Connected to Supabase Cloud.")
+st.caption("Connected to Supabase Cloud.")
 
 if not supabase:
     st.warning("⚠️ Database connection missing. Check Streamlit Cloud Settings -> Secrets.")
 else:
     if st.button("🔄 Fetch & Validate Competitions Now"):
-        with st.spinner("Scouring local feeds, checking links, and updating database..."):
+        with st.spinner("Scouring feeds, checking links, and updating database..."):
             fetch_competitions()
             st.success("Updated & Saved!")
             time.sleep(1)
