@@ -31,9 +31,49 @@ def mark_as_clicked(comp_id):
     if supabase:
         supabase.table("competitions").update({"clicked": True}).eq("id", comp_id).execute()
 
-# --- 3. LIVE LINK & EXPIRY VALIDATOR ---
-def is_link_valid(url):
-    """Checks for 200 OK status and screens page text for closure signals."""
+# --- 3. HARD EXCLUSIONS & FORM-VALIDATION ENGINE ---
+def is_valid_competition_entry(url, title):
+    """
+    Blocks news articles, past winner stories, paid raffles/paywalls,
+    and lead-gen traps. Requires a real HTML entry form or widget.
+    """
+    text_lower = title.lower()
+    url_lower = url.lower()
+
+    # A. REJECT NEWS/ARTICLE URL PATHS
+    article_paths = ["/news/", "/article/", "/story/", "/sport/", "/community/", "/features/", "/press-release/"]
+    if any(path in url_lower for path in article_paths):
+        return False
+
+    # B. REJECT PAST-TENSE & WINNER ANNOUNCEMENT WORDS
+    winner_story_terms = [
+        " wins ", " won ", " winner ", " winner:", "awarded", "scoops", "claims prize", 
+        "takes home", "crowned", "celebrates", "bags ", "handed ", "receives "
+    ]
+    if any(term in text_lower for term in winner_story_terms):
+        return False
+
+    # C. CONTROL 1: REJECT PAYWALLS, TICKETING & LEAD-GEN TRAPS
+    paid_or_trap_terms = [
+        "ticket required", "buy a ", "entry fee", "per ticket", "raffle ticket", 
+        "subscription required", "get a quote", "complete offer", "part 1 of 5", 
+        "marketing survey", "insurance quote", "paid entry"
+    ]
+    if any(trap in text_lower for trap in paid_or_trap_terms):
+        return False
+
+    # D. MUST CONTAIN ACTIVE ENTRY INTENT
+    active_intent_terms = ["enter", "win a", "win this", "giveaway", "competition", "free entry", "prize draw"]
+    if not any(term in text_lower for term in active_intent_terms):
+        return False
+
+    # E. CHECK YEAR AGE (Drop anything referencing previous years in title)
+    current_year = datetime.date.today().year
+    past_years = [str(y) for y in range(2020, current_year)]
+    if any(year in title for year in past_years):
+        return False
+
+    # F. CONTROL 2: LIVE HTTP & HTML FORM / WIDGET INSPECTION
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         resp = requests.get(url, headers=headers, timeout=6)
@@ -43,14 +83,27 @@ def is_link_valid(url):
         soup = BeautifulSoup(resp.text, 'html.parser')
         page_text = soup.get_text().lower()
         
-        # Hard fail if page explicitly declares closure
+        # Hard signals that a page is closed
         closed_signals = [
             "competition closed", "giveaway closed", "winner has been contacted", 
-            "no longer accepting entries", "giveaway ended", "entries are now closed"
+            "no longer accepting entries", "giveaway ended", "entries are now closed",
+            "this competition has now ended", "sorry, this competition is over", "congratulations to our winner"
         ]
         if any(signal in page_text for signal in closed_signals):
             return False
-            
+
+        # Additional text check for lead-gen traps in page content
+        if any(trap in page_text for trap in ["complete survey to enter", "purchase necessary", "£ per entry"]):
+            return False
+
+        # Form presence check: Ensure HTML contains an actual form, input field, or widget iframe
+        has_form = bool(soup.find("form"))
+        has_input = bool(soup.find("input", {"type": re.compile(r"email|text|submit|radio|checkbox", re.I)}))
+        has_widget = any(w in resp.text.lower() for w in ["gleam.io", "rafflecopter", "promosimple", "iframe", "glisser"])
+
+        if not (has_form or has_input or has_widget):
+            return False  # Drop pages without an entry mechanism
+
         return True
     except Exception:
         return False
@@ -60,6 +113,7 @@ def calculate_score(title, url):
     """
     Ranks probability:
     + Boosts niche UK sites, independent blogs, local domains, and tight deadlines.
+    + Boosts embedded entry widgets (Gleam/Rafflecopter).
     - Penalizes high-traffic national brands and mandatory media/tagging requirements.
     """
     score = 70.0
@@ -67,33 +121,26 @@ def calculate_score(title, url):
     url_lower = url.lower()
 
     # --- BOOSTS (Niche / Low Traffic / High Probability) ---
-    # Independent blogs / local business site patterns
     if any(k in url_lower for k in [".co.uk/blog", "wordpress", "blogspot", "local", "independent"]):
         score += 25.0
+
+    if any(widget in url_lower for widget in ["gleam.io", "rafflecopter"]):
+        score += 30.0
     
-    # Specific entry types requiring slightly more effort (fewer total entrants)
     if any(k in text_lower for k in ["answer a question", "fill in form", "email to enter", "comment below"]):
         score += 15.0
 
-    # Short Expiry / Urgency (Less time for high entry counts)
     if any(k in text_lower for k in ["closes today", "ends tonight", "24 hours left", "ends tomorrow", "quick enter"]):
         score += 20.0
 
-    # --- PENALTIES (High Traffic / Low Probability / Social Hassle) ---
-    # Media/photo upload or friend tagging mandates
+    # --- PENALTIES ---
     if any(k in text_lower for k in ["tag a friend", "tag 3 friends", "upload photo", "submit video", "instagram"]):
         score -= 50.0
 
-    # Mass-market / High-traffic national aggregators & brands
     high_traffic_domains = ["tesco", "itv", "cadbury", "sainsburys", "argos", "amazon", "asda", "mcdonalds", "hotukdeals"]
     for brand in high_traffic_domains:
         if brand in text_lower or brand in url_lower:
             score -= 35.0
-
-    # Non-competition news noise filter
-    junk_terms = ["police", "court", "council", "mayor", "sports match", "league", "accident", "review"]
-    if any(junk in text_lower for junk in junk_terms):
-        return 0.0
 
     return max(score, 0.0)
 
@@ -101,7 +148,7 @@ def extract_closing_date(text):
     match = re.search(r'(closes|ending|ends|entry by)\s*(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+|\d{1,2}/\d{1,2})', text, re.IGNORECASE)
     return match.group(0) if match else "Not Specified"
 
-# --- 5. DIRECT UK WEB SCRAPER ---
+# --- 5. BROAD-SCOPE UK WEB SCRAPER ---
 def fetch_competitions():
     if not supabase:
         st.error("Cannot fetch: Supabase is not connected.")
@@ -110,12 +157,14 @@ def fetch_competitions():
     new_comps = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    # Target direct UK sites while excluding social media networks & general news
+    negative_terms = "-news -court -police -match -award -league -report -council -wins -won -winner -article -ticket -buy"
+    
     queries = [
-        'site:.co.uk "win" "enter competition" -site:x.com -site:twitter.com -site:instagram.com -site:facebook.com -site:tiktok.com',
-        'site:.co.uk/competitions "win" "closing date" -site:x.com -site:instagram.com -site:facebook.com',
-        'site:.co.uk "giveaway" "fill in the form" -site:x.com -site:instagram.com -news',
-        'site:.co.uk "blog giveaway" "win" "uk residents"'
+        f'site:.co.uk "enter competition" OR "win a" -site:x.com -site:twitter.com -site:instagram.com {negative_terms}',
+        f'site:.co.uk/competitions "win" "closing date" -site:x.com -site:instagram.com {negative_terms}',
+        f'site:.co.uk "giveaway" "fill in the form" -site:x.com -site:instagram.com {negative_terms}',
+        f'site:.co.uk "blog giveaway" "win" "uk residents" {negative_terms}',
+        f'site:gleam.io "uk" "win" OR "giveaway"'
     ]
 
     for query in queries:
@@ -125,26 +174,27 @@ def fetch_competitions():
             resp = requests.get(google_url, headers=headers, timeout=8)
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.content, "xml")
-                for item in soup.find_all("item")[:10]:
+                for item in soup.find_all("item")[:20]:
                     title = item.find("title").text if item.find("title") else "UK Competition Entry"
                     link = item.find("link").text if item.find("link") else ""
                     
-                    # Sanity check: Exclude social media domains
                     if link and not any(social in link.lower() for social in ["x.com", "twitter.com", "instagram.com", "facebook.com", "tiktok.com"]):
-                        score = calculate_score(title, link)
-                        if score >= 30.0 and is_link_valid(link):
-                            new_comps.append({
-                                "title": title.strip(),
-                                "url": link.strip(),
-                                "source": "Direct Web Form",
-                                "visibility_score": score,
-                                "date_added": datetime.date.today().isoformat(),
-                                "closing_date": extract_closing_date(title)
-                            })
+                        # Screen for live forms, remove paywalls/traps/articles
+                        if is_valid_competition_entry(link, title):
+                            score = calculate_score(title, link)
+                            if score >= 30.0:
+                                new_comps.append({
+                                    "title": title.strip(),
+                                    "url": link.strip(),
+                                    "source": "Direct Web Entry",
+                                    "visibility_score": score,
+                                    "date_added": datetime.date.today().isoformat(),
+                                    "closing_date": extract_closing_date(title)
+                                })
         except Exception:
             pass
 
-    # UPSERT TO SUPABASE DB (Deduplicates on 'url')
+    # UPSERT TO SUPABASE DB
     for comp in new_comps:
         try:
             supabase.table("competitions").upsert(comp, on_conflict="url").execute()
@@ -153,19 +203,18 @@ def fetch_competitions():
 
 # --- 6. USER INTERFACE ---
 st.title("🏆 UK High-Probability Competition Finder")
-st.caption("Scouring direct UK web sources. Prioritizing niche, low-entry competitions.")
+st.caption("Filters out paywalls, quote traps, articles, and pages without active entry forms.")
 
 if not supabase:
     st.warning("⚠️ Database connection missing. Check Streamlit Cloud Settings -> Secrets.")
 else:
     if st.button("🔄 Fetch & Rank Live Competitions Now"):
-        with st.spinner("Scouring direct UK web feeds, scoring probability, and updating database..."):
+        with st.spinner("Scanning pages for active HTML entry forms and widgets..."):
             fetch_competitions()
-            st.success("Database updated with fresh opportunities!")
+            st.success("Database updated with verified active entry pages!")
             time.sleep(1)
             st.rerun()
 
-    # Query unclicked items ordered by highest score first
     try:
         response = supabase.table("competitions").select("*").eq("clicked", False).order("visibility_score", desc=True).execute()
         data = response.data
@@ -181,7 +230,7 @@ else:
         for row in data:
             st.markdown(f"### [{row['title']}]({row['url']})")
             closing_text = f" | ⏳ **Closing:** {row['closing_date']}" if row['closing_date'] != "Not Specified" else ""
-            st.caption(f"Score: **{int(row['visibility_score'])} pts** (High Probability) | Added: {row['date_added']}{closing_text}")
+            st.caption(f"Score: **{int(row['visibility_score'])} pts** | Added: {row['date_added']}{closing_text}")
             
             col1, col2 = st.columns([1, 1])
             with col1:
