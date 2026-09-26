@@ -1,26 +1,64 @@
+import streamlit as st
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+import datetime
+import time
+import urllib.parse
+import re
+from supabase import create_client, Client
+
+# --- ALWAYS SET PAGE CONFIG FIRST ---
+st.set_page_config(page_title="UK Low-Entry Competition Dashboard", layout="wide")
+
+# --- SAFE SUPABASE INIT ---
+@st.cache_resource
+def init_supabase():
+    try:
+        url = st.secrets.get("SUPABASE_URL", "").strip().rstrip("/")
+        key = st.secrets.get("SUPABASE_KEY", "").strip()
+        if not url or not key:
+            st.error("Missing Supabase secrets! Please check Streamlit Cloud Settings -> Secrets.")
+            return None
+        return create_client(url, key)
+    except Exception as e:
+        st.error(f"Failed to connect to Supabase: {e}")
+        return None
+
+supabase = init_supabase()
+
+def mark_as_clicked(comp_id):
+    if supabase:
+        supabase.table("competitions").update({"clicked": True}).eq("id", comp_id).execute()
+
+# --- VALIDATION ENGINE (DEAD & CLOSED LINKS) ---
+def is_link_valid(url):
+    """Verifies link returns 200 OK and is not marked as closed on page."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code != 200:
+            return False
+        
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        page_text = soup.get_text().lower()
+        
+        closed_signals = ["competition closed", "winner has been contacted", "no longer accepting entries", "giveaway ended"]
+        for signal in closed_signals:
+            if signal in page_text:
+                return False
+        return True
+    except Exception:
+        return False
+
 # --- HEURISTIC SCORE ENGINE ---
 def calculate_score(title, source):
     """Calculates visibility & odds score based on user requirements."""
     score = 80.0
     text_lower = title.lower()
 
-    # 1. DISCARD GENERAL NEWS & EDITORIAL ARTICLES
-    news_junk_terms = [
-        "says", "report", "police", "court", "council", "mayor", "minister", 
-        "award", "won award", "wins award", "sports", "match", "league", 
-        "accident", "crash", "investigation", "recap", "review", "opinion"
-    ]
-    for term in news_junk_terms:
-        if term in text_lower:
-            return 0.0
-
-    # 2. MUST CONTAIN AN INTENT TO GIVE SOMETHING AWAY
-    comp_intent_terms = ["win", "giveaway", "competition", "free entry", "prize", "enter to win"]
-    if not any(intent in text_lower for intent in comp_intent_terms):
-        return 0.0
-
-    # NO. 2 PENALTIES: Avoid photo uploads or mandatory friend tagging
-    avoid_terms = ["tag a friend", "tag 3 friends", "tag your friends", "upload a photo", "submit a video", "picture entry"]
+    # NO. 2 PENALTIES: Avoid photo/media uploads or mandatory friend tagging
+    avoid_terms = ["tag a friend", "tag 3 friends", "tag your friends", "upload a photo", "submit a video", "picture entry", "upload an image"]
     for term in avoid_terms:
         if term in text_lower:
             score -= 80.0
@@ -40,6 +78,10 @@ def calculate_score(title, source):
 
     return max(score, 0.0)
 
+def extract_closing_date(text):
+    match = re.search(r'(closes|ending|ends|entry by)\s*(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+|\d{1,2}/\d{1,2})', text, re.IGNORECASE)
+    return match.group(0) if match else "Not Specified"
+
 # --- SCRAPING & INGESTION ENGINES ---
 def fetch_competitions():
     if not supabase:
@@ -49,13 +91,10 @@ def fetch_competitions():
     new_comps = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # EXCLUDE GENERAL NEWS TERMS IN GOOGLE SEARCH PARAMETERS
-    negative_operators = "-news -court -police -match -award -league -report -council"
-
-    # 1. LOCAL & REGIONAL BUSINESS ENGINE
+    # NO. 1 LOCAL & REGIONAL BUSINESS ENGINE
     local_queries = [
-        f'site:.co.uk "enter to win" OR "competition" ("London" OR "Manchester" OR "Birmingham" OR "Yorkshire") {negative_operators}',
-        f'site:.co.uk "win" "giveaway" ("local business" OR "independent shop") {negative_operators}'
+        'site:.co.uk "win" "giveaway" ("London" OR "Manchester" OR "Birmingham" OR "Yorkshire")',
+        'site:.co.uk "competition" ("local business" OR "independent shop") "win"'
     ]
     
     for query in local_queries:
@@ -66,9 +105,9 @@ def fetch_competitions():
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.content, "xml")
                 for item in soup.find_all("item")[:8]:
-                    title = item.find("title").text if item.find("title") else ""
+                    title = item.find("title").text if item.find("title") else "Local UK Giveaway"
                     link = item.find("link").text if item.find("link") else ""
-                    if link and title and is_link_valid(link):
+                    if link and is_link_valid(link):
                         score = calculate_score(title, "Local Business UK")
                         if score > 20.0:
                             new_comps.append({
@@ -82,10 +121,10 @@ def fetch_competitions():
         except Exception:
             pass
 
-    # 2. X & INSTAGRAM ENGINES
+    # X & INSTAGRAM ENGINES
     social_queries = [
-        (f'site:x.com "uk giveaway" OR "competition" "retweet" "uk only" {negative_operators}', "X (Twitter)", "𝕏: "),
-        (f'site:instagram.com/p/ "uk giveaway" OR "win" "uk only" {negative_operators}', "Instagram", "📸 IG: ")
+        ('site:x.com "uk giveaway" OR "win" "retweet" "uk only"', "X (Twitter)", "𝕏: "),
+        ('site:instagram.com/p/ "uk giveaway" OR "win" "uk only"', "Instagram", "📸 IG: ")
     ]
 
     for query, source_label, prefix in social_queries:
@@ -96,9 +135,9 @@ def fetch_competitions():
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.content, "xml")
                 for item in soup.find_all("item")[:8]:
-                    title = item.find("title").text if item.find("title") else ""
+                    title = item.find("title").text if item.find("title") else "Social Giveaway"
                     link = item.find("link").text if item.find("link") else ""
-                    if link and title and is_link_valid(link):
+                    if link and is_link_valid(link):
                         score = calculate_score(title, source_label)
                         if score > 20.0:
                             new_comps.append({
@@ -118,3 +157,43 @@ def fetch_competitions():
             supabase.table("competitions").upsert(comp, on_conflict="url").execute()
         except Exception:
             pass
+
+# --- DASHBOARD UI ---
+st.title("🏆 UK Low-Entry Competition Finder")
+st.caption("Filtering out tagging and upload requirements. Connected to Supabase Cloud.")
+
+if not supabase:
+    st.warning("⚠️ Database connection missing. Check Streamlit Cloud Settings -> Secrets.")
+else:
+    if st.button("🔄 Fetch & Validate Competitions Now"):
+        with st.spinner("Scouring local feeds, checking links, and updating database..."):
+            fetch_competitions()
+            st.success("Updated & Saved!")
+            time.sleep(1)
+            st.rerun()
+
+    try:
+        response = supabase.table("competitions").select("*").eq("clicked", False).order("visibility_score", desc=True).execute()
+        data = response.data
+    except Exception as e:
+        st.error(f"Error querying Supabase: {e}")
+        data = []
+
+    st.subheader(f"Available High-Probability Competitions ({len(data)})")
+
+    if not data:
+        st.info("No unclicked competitions available. Tap 'Fetch & Validate Competitions Now' above.")
+    else:
+        for row in data:
+            st.markdown(f"### [{row['title']}]({row['url']})")
+            closing_text = f" ⏳ **Closing:** {row['closing_date']}" if row['closing_date'] != "Not Specified" else ""
+            st.caption(f"Source: **{row['source']}** | Added: {row['date_added']} | Score: **{int(row['visibility_score'])} pts**{closing_text}")
+            
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                st.markdown(f'<a href="{row["url"]}" target="_blank"><button style="width:100%; padding: 10px; background-color: #4CAF50; color: white; border: none; border-radius: 5px; font-size:16px;">Open Competition ↗</button></a>', unsafe_allow_html=True)
+            with col2:
+                if st.button("Mark Completed ✅", key=f"btn_{row['id']}"):
+                    mark_as_clicked(row['id'])
+                    st.rerun()
+            st.divider()
