@@ -44,6 +44,10 @@ def is_valid_competition_entry(url, title):
     text_lower = title.lower()
     url_lower = url.lower()
 
+    # Reject Gleam links entirely
+    if "gleam.io" in url_lower:
+        return False
+
     # A. REJECT NEWS/ARTICLE URL PATHS
     article_paths = ["/news/", "/article/", "/story/", "/sport/", "/community/", "/features/", "/press-release/"]
     if any(path in url_lower for path in article_paths):
@@ -99,10 +103,10 @@ def is_valid_competition_entry(url, title):
         if any(trap in page_text for trap in ["complete survey to enter", "purchase necessary", "£ per entry"]):
             return False
 
-        # Form presence check
+        # Form presence check (Gleam removed)
         has_form = bool(soup.find("form"))
         has_input = bool(soup.find("input", {"type": re.compile(r"email|text|submit|radio|checkbox", re.I)}))
-        has_widget = any(w in resp.text.lower() for w in ["gleam.io", "rafflecopter", "promosimple", "iframe", "glisser"])
+        has_widget = any(w in resp.text.lower() for w in ["rafflecopter", "promosimple", "iframe", "glisser"])
 
         if not (has_form or has_input or has_widget):
             return False
@@ -120,7 +124,7 @@ def calculate_score(title, url):
     if any(k in url_lower for k in [".co.uk/blog", "wordpress", "blogspot", "local", "independent"]):
         score += 25.0
 
-    if any(widget in url_lower for widget in ["gleam.io", "rafflecopter"]):
+    if "rafflecopter" in url_lower:
         score += 30.0
     
     if any(k in text_lower for k in ["answer a question", "fill in form", "email to enter", "comment below"]):
@@ -152,14 +156,14 @@ def fetch_competitions():
     new_comps = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    negative_terms = "-news -court -police -match -award -league -report -council -wins -won -winner -article -ticket -buy"
+    # Explicitly excludes gleam.io
+    negative_terms = "-news -court -police -match -award -league -report -council -wins -won -winner -article -ticket -buy -site:gleam.io"
     
     queries = [
         f'site:.co.uk "enter competition" OR "win a" -site:x.com -site:twitter.com -site:instagram.com {negative_terms}',
         f'site:.co.uk/competitions "win" "closing date" -site:x.com -site:instagram.com {negative_terms}',
         f'site:.co.uk "giveaway" "fill in the form" -site:x.com -site:instagram.com {negative_terms}',
-        f'site:.co.uk "blog giveaway" "win" "uk residents" {negative_terms}',
-        f'site:gleam.io "uk" "win" OR "giveaway"'
+        f'site:.co.uk "blog giveaway" "win" "uk residents" {negative_terms}'
     ]
 
     for query in queries:
@@ -173,7 +177,7 @@ def fetch_competitions():
                     title = item.find("title").text if item.find("title") else "UK Competition Entry"
                     link = item.find("link").text if item.find("link") else ""
                     
-                    if link and not any(social in link.lower() for social in ["x.com", "twitter.com", "instagram.com", "facebook.com", "tiktok.com"]):
+                    if link and not any(social in link.lower() for social in ["x.com", "twitter.com", "instagram.com", "facebook.com", "tiktok.com", "gleam.io"]):
                         if is_valid_competition_entry(link, title):
                             score = calculate_score(title, link)
                             if score >= 30.0:
@@ -222,7 +226,6 @@ else:
             st.rerun()
 
     try:
-        # Fetch only competitions that are NEITHER clicked NOR dismissed
         response = supabase.table("competitions").select("*").eq("clicked", False).or_("dismissed.is.null,dismissed.eq.false").order("visibility_score", desc=True).execute()
         data = response.data
     except Exception as e:
