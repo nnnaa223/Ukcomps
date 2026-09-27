@@ -70,7 +70,7 @@ def is_valid_competition_entry(url, title):
     if any(platform in url_lower for platform in WIDGET_PLATFORM_BLOCKLIST):
         return False, "Widget Platform Blocked"
 
-    # Reject T&Cs / Privacy / Rules
+    # Reject T&Cs / Privacy / Rules specifically (allow general /competition/ landing pages)
     tc_paths_and_terms = [
         "/terms", "/terms-and-conditions", "/terms-conditions", "/rules", 
         "/t-and-cs", "/tc", "/tcs", "terms & conditions", "terms and conditions",
@@ -102,8 +102,11 @@ def is_valid_competition_entry(url, title):
     if any(trap in text_lower for trap in paid_or_trap_terms):
         return False, "Paywall or Lead-Gen Trap"
 
-    # Must contain entry intent in title
-    active_intent_terms = ["enter", "win a", "win this", "giveaway", "competition", "free entry", "prize draw"]
+    # EXPANDED ENTRY INTENT TERMS (Fixes VisitBristol, Oliver Bonas, etc.)
+    active_intent_terms = [
+        "enter", "win", "giveaway", "competition", "competitions", 
+        "free entry", "prize draw", "prize", "pledge", "chance to win"
+    ]
     if not any(term in text_lower for term in active_intent_terms):
         return False, "Missing Entry Intent in Title"
 
@@ -135,11 +138,14 @@ def is_valid_competition_entry(url, title):
         if any(trap in page_text for trap in ["complete survey to enter", "purchase necessary", "£ per entry"]):
             return False, "Survey or Paid Requirement in Body"
 
+        # EXPANDED FORM & IFRAME / JS DETECTION (Fixes LNER, Sharps, Bella, etc.)
         has_form = bool(soup.find("form"))
         has_input = bool(soup.find("input", {"type": re.compile(r"email|text|submit|radio|checkbox", re.I)}))
         has_entry_phrases = any(phrase in page_text for phrase in [
             "fill in", "enter details", "enter below", "complete the form", 
-            "to enter", "leave a comment", "comment below", "tag a friend"
+            "to enter", "leave a comment", "comment below", "tag a friend",
+            "typeform", "hubspot", "iframe", "terms & conditions apply",
+            "submit your entry", "first prize", "win a", "enter here", "competition"
         ])
 
         if not (has_form or has_input or has_entry_phrases):
@@ -194,10 +200,11 @@ def fetch_competitions():
         st.error("⚠️ Missing SerpApi Key! Please set SERPAPI_KEY in Streamlit Cloud Secrets.")
         return
 
+    # EXPANDED SEARCH QUERIES (.co.uk, .com, .co, inurl paths)
     queries = [
-        'site:.co.uk competition "enter" -terms',
-        'site:.co.uk giveaway "win" -terms',
-        'site:.co.uk/competitions "win" "closing date" -terms',
+        'site:.co.uk OR site:.com "win" "competition" UK "enter"',
+        'site:.co.uk OR site:.com giveaway "UK residents" "enter"',
+        'inurl:competition OR inurl:competitions UK "win"',
         'site:instagram.com "uk giveaway" OR "uk competition" "win"'
     ]
 
@@ -218,7 +225,7 @@ def fetch_competitions():
             "q": query,
             "gl": "gb",
             "hl": "en",
-            "tbs": "qdr:m2",
+            "tbs": "qdr:m2",  # Restricts Google results to past 2 months
             "api_key": serpapi_key
         }
         try:
@@ -248,7 +255,7 @@ def fetch_competitions():
                 rejected_comps.append(rejected_item)
                 stats["rejected"] += 1
 
-    # Save passed competitions
+    # Save passed competitions to DB
     for comp in passed_comps:
         try:
             supabase.table("competitions").upsert(comp, on_conflict="url").execute()
