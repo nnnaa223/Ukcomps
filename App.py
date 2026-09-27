@@ -17,6 +17,8 @@ WIDGET_PLATFORM_BLOCKLIST = [
     "kingsumo", "viralsweep", "wishpond", "shortstack", "vyper"
 ]
 
+SOCIAL_DOMAINS = ["instagram.com", "facebook.com", "twitter.com", "x.com", "tiktok.com"]
+
 # --- 3. SUPABASE INITIALIZATION ---
 @st.cache_resource
 def init_supabase():
@@ -70,7 +72,7 @@ def is_valid_competition_entry(url, title):
     if any(platform in url_lower for platform in WIDGET_PLATFORM_BLOCKLIST):
         return False, "Widget Platform Blocked"
 
-    # Reject T&Cs / Privacy / Rules specifically (allow general /competition/ landing pages)
+    # Reject T&Cs / Privacy / Rules specifically
     tc_paths_and_terms = [
         "/terms", "/terms-and-conditions", "/terms-conditions", "/rules", 
         "/t-and-cs", "/tc", "/tcs", "terms & conditions", "terms and conditions",
@@ -102,7 +104,7 @@ def is_valid_competition_entry(url, title):
     if any(trap in text_lower for trap in paid_or_trap_terms):
         return False, "Paywall or Lead-Gen Trap"
 
-    # EXPANDED ENTRY INTENT TERMS (Fixes VisitBristol, Oliver Bonas, etc.)
+    # EXPANDED ENTRY INTENT TERMS
     active_intent_terms = [
         "enter", "win", "giveaway", "competition", "competitions", 
         "free entry", "prize draw", "prize", "pledge", "chance to win"
@@ -110,11 +112,11 @@ def is_valid_competition_entry(url, title):
     if not any(term in text_lower for term in active_intent_terms):
         return False, "Missing Entry Intent in Title"
 
-    # Instagram Bypass for Raw HTML Checks
-    if "instagram.com" in url_lower:
+    # Social Media Bypass (Skip HTTP raw form inspection since social posts don't use standard html forms)
+    if any(domain in url_lower for domain in SOCIAL_DOMAINS):
         return True, "Not Specified"
 
-    # Live HTTP Inspection
+    # Live HTTP Inspection for Standard Websites
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         resp = requests.get(url, headers=headers, timeout=5)
@@ -138,7 +140,7 @@ def is_valid_competition_entry(url, title):
         if any(trap in page_text for trap in ["complete survey to enter", "purchase necessary", "£ per entry"]):
             return False, "Survey or Paid Requirement in Body"
 
-        # EXPANDED FORM & IFRAME / JS DETECTION (Fixes LNER, Sharps, Bella, etc.)
+        # EXPANDED FORM & IFRAME / JS DETECTION
         has_form = bool(soup.find("form"))
         has_input = bool(soup.find("input", {"type": re.compile(r"email|text|submit|radio|checkbox", re.I)}))
         has_entry_phrases = any(phrase in page_text for phrase in [
@@ -163,14 +165,6 @@ def process_single_search_result(item):
 
     if not final_url:
         return None, None
-
-    if any(social in final_url.lower() for social in ["x.com", "twitter.com", "facebook.com", "tiktok.com"]):
-        return None, {
-            "title": title.strip(),
-            "url": final_url.strip(),
-            "reason": "Social Network Blocked (X/FB/TikTok)",
-            "date_added": datetime.date.today().isoformat()
-        }
 
     is_valid, date_or_reason = is_valid_competition_entry(final_url, title)
     if is_valid:
@@ -200,12 +194,11 @@ def fetch_competitions():
         st.error("⚠️ Missing SerpApi Key! Please set SERPAPI_KEY in Streamlit Cloud Secrets.")
         return
 
-    # EXPANDED SEARCH QUERIES (.co.uk, .com, .co, inurl paths)
     queries = [
         'site:.co.uk OR site:.com "win" "competition" UK "enter"',
         'site:.co.uk OR site:.com giveaway "UK residents" "enter"',
         'inurl:competition OR inurl:competitions UK "win"',
-        'site:instagram.com "uk giveaway" OR "uk competition" "win"'
+        'site:instagram.com OR site:facebook.com OR site:twitter.com "uk giveaway" OR "uk competition" "win"'
     ]
 
     stats = {
@@ -225,7 +218,7 @@ def fetch_competitions():
             "q": query,
             "gl": "gb",
             "hl": "en",
-            "tbs": "qdr:m2",  # Restricts Google results to past 2 months
+            "tbs": "qdr:m2",
             "api_key": serpapi_key
         }
         try:
@@ -255,7 +248,7 @@ def fetch_competitions():
                 rejected_comps.append(rejected_item)
                 stats["rejected"] += 1
 
-    # Save passed competitions to DB
+    # Save passed competitions
     for comp in passed_comps:
         try:
             supabase.table("competitions").upsert(comp, on_conflict="url").execute()
@@ -282,7 +275,7 @@ header_col1, header_col2 = st.columns([3, 1])
 
 with header_col1:
     st.title("🏆 UK Live Competition Finder")
-    st.caption("Active giveaways & competitions from blogs, sites, and Instagram (past 2 months).")
+    st.caption("Active giveaways & competitions from web sources and social networks.")
 
 with header_col2:
     completed_count = 0
@@ -305,45 +298,63 @@ else:
 
     try:
         response = supabase.table("competitions").select("*").eq("clicked", False).or_("dismissed.is.null,dismissed.eq.false").order("date_added", desc=True).execute()
-        data = response.data
+        all_data = response.data
     except Exception as e:
         st.error(f"Error querying Supabase: {e}")
-        data = []
+        all_data = []
 
-    st.subheader(f"Available Opportunities ({len(data)})")
+    # Filter into Web vs Social lists
+    web_comps = [c for c in all_data if not any(soc in c['url'].lower() for soc in SOCIAL_DOMAINS)]
+    social_comps = [c for c in all_data if any(soc in c['url'].lower() for soc in SOCIAL_DOMAINS)]
 
-    if not data:
-        st.info("No unclicked competitions available. Tap 'Fetch & Rank Live Competitions Now' above.")
-    else:
-        for row in data:
-            st.markdown(f"### [{row['title']}]({row['url']})")
-            closing_text = f" | ⏳ **Closing:** {row['closing_date']}" if row['closing_date'] != "Not Specified" else ""
-            st.caption(f"Added: **{row['date_added']}**{closing_text}")
-            
-            col1, col2, col3 = st.columns([2, 1, 1])
-            with col1:
-                st.link_button("Open Competition ↗", row["url"], use_container_width=True)
-            with col2:
-                if st.button("Completed ✅", key=f"btn_complete_{row['id']}", use_container_width=True):
-                    mark_as_clicked(row['id'])
-                    st.rerun()
-            with col3:
-                if st.button("Not Interested ❌", key=f"btn_dismiss_{row['id']}", use_container_width=True):
-                    mark_as_dismissed(row['id'])
-                    st.rerun()
-            st.divider()
+    # TAB UI STRUCTURE
+    tab_web, tab_social, tab_rejected = st.tabs([
+        f"🌐 Web Competitions ({len(web_comps)})", 
+        f"📱 Social Media Giveaways ({len(social_comps)})", 
+        "🔍 Rejected Candidates"
+    ])
 
-    # --- REJECTIONS MANUAL RESCUE UI ---
-    st.write("---")
-    with st.expander("🔍 Inspect Recently Rejected Candidates (Manual Rescue)"):
+    # RENDER HELPER FUNCTION FOR CARDS
+    def render_comp_list(items_list, empty_msg):
+        if not items_list:
+            st.info(empty_msg)
+        else:
+            for row in items_list:
+                st.markdown(f"### [{row['title']}]({row['url']})")
+                closing_text = f" | ⏳ **Closing:** {row['closing_date']}" if row['closing_date'] != "Not Specified" else ""
+                st.caption(f"Added: **{row['date_added']}**{closing_text}")
+                
+                col1, col2, col3 = st.columns([2, 1, 1])
+                with col1:
+                    st.link_button("Open Competition ↗", row["url"], use_container_width=True)
+                with col2:
+                    if st.button("Completed ✅", key=f"btn_complete_{row['id']}", use_container_width=True):
+                        mark_as_clicked(row['id'])
+                        st.rerun()
+                with col3:
+                    if st.button("Not Interested ❌", key=f"btn_dismiss_{row['id']}", use_container_width=True):
+                        mark_as_dismissed(row['id'])
+                        st.rerun()
+                st.divider()
+
+    # TAB 1: WEB COMPETITIONS
+    with tab_web:
+        render_comp_list(web_comps, "No active web competitions available. Tap 'Fetch & Rank Live Competitions Now' above.")
+
+    # TAB 2: SOCIAL MEDIA COMPETITIONS
+    with tab_social:
+        render_comp_list(social_comps, "No active social media giveaways found right now.")
+
+    # TAB 3: REJECTED CANDIDATES & RESCUE LOG
+    with tab_rejected:
         try:
-            rej_response = supabase.table("rejections").select("*").order("id", desc=True).limit(30).execute()
+            rej_response = supabase.table("rejections").select("*").order("id", desc=True).limit(40).execute()
             rej_data = rej_response.data
             
             if not rej_data:
                 st.write("No rejected items logged yet.")
             else:
-                st.caption("Review items filtered out by your validation engine. If any look legitimate, click Rescue to add them to your active list.")
+                st.caption("Review items filtered out by your validation engine. If any look legitimate, click Rescue to add them to your live feeds.")
                 for row in rej_data:
                     col_a, col_b = st.columns([3, 1])
                     with col_a:
@@ -351,7 +362,6 @@ else:
                         st.caption(f"Reason: `{row['reason']}` | Added: {row['date_added']}")
                     with col_b:
                         if st.button("Rescue & Move to Live ↗", key=f"btn_rescue_{row['id']}", use_container_width=True):
-                            # Move to competitions table
                             supabase.table("competitions").upsert({
                                 "title": row["title"],
                                 "url": row["url"],
@@ -360,9 +370,8 @@ else:
                                 "date_added": row["date_added"],
                                 "closing_date": "Not Specified"
                             }, on_conflict="url").execute()
-                            # Delete from rejections
                             supabase.table("rejections").delete().eq("id", row["id"]).execute()
                             st.rerun()
                     st.divider()
-        except Exception as e:
-            st.info("Rejections table not ready yet. Ensure you ran the SQL query in Supabase!")
+        except Exception:
+            st.info("Rejections table not connected or empty.")
