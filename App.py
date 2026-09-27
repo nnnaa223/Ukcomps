@@ -5,13 +5,14 @@ from bs4 import BeautifulSoup
 import datetime
 import time
 import re
+
 from concurrent.futures import ThreadPoolExecutor
 from supabase import create_client, Client
 
 # --- 1. PAGE CONFIG & LAYOUT ---
 st.set_page_config(page_title="UK Live Competition Tracker", layout="wide")
 
-# --- 2. WIDGET PLATFORM BLOCKLIST ---
+# --- 2. BLOCKLISTS & CONSTANTS ---
 WIDGET_PLATFORM_BLOCKLIST = [
     "gleam.io", "rafflecopter", "promosimple", "woobox", 
     "kingsumo", "viralsweep", "wishpond", "shortstack", "vyper"
@@ -104,7 +105,7 @@ def is_valid_competition_entry(url, title):
     if any(trap in text_lower for trap in paid_or_trap_terms):
         return False, "Paywall or Lead-Gen Trap"
 
-    # EXPANDED ENTRY INTENT TERMS
+    # Active Entry Intent Check
     active_intent_terms = [
         "enter", "win", "giveaway", "competition", "competitions", 
         "free entry", "prize draw", "prize", "pledge", "chance to win"
@@ -112,7 +113,7 @@ def is_valid_competition_entry(url, title):
     if not any(term in text_lower for term in active_intent_terms):
         return False, "Missing Entry Intent in Title"
 
-    # Social Media Bypass (Skip HTTP raw form inspection since social posts don't use standard html forms)
+    # Social Media Bypass (Bypasses raw HTML checks since social posts don't use standard forms)
     if any(domain in url_lower for domain in SOCIAL_DOMAINS):
         return True, "Not Specified"
 
@@ -140,7 +141,6 @@ def is_valid_competition_entry(url, title):
         if any(trap in page_text for trap in ["complete survey to enter", "purchase necessary", "£ per entry"]):
             return False, "Survey or Paid Requirement in Body"
 
-        # EXPANDED FORM & IFRAME / JS DETECTION
         has_form = bool(soup.find("form"))
         has_input = bool(soup.find("input", {"type": re.compile(r"email|text|submit|radio|checkbox", re.I)}))
         has_entry_phrases = any(phrase in page_text for phrase in [
@@ -158,7 +158,54 @@ def is_valid_competition_entry(url, title):
     except Exception as e:
         return False, f"Connection Failed ({type(e).__name__})"
 
-# --- 6. PARALLEL SCRAPER ENGINE ---
+# --- 6. DIRECT DIRECTORY CRAWLER (AWESOME FREEBIES) ---
+def crawl_awesome_freebies():
+    """
+    Crawls Awesome Freebies 'Ending Soon' pages directly, resolves outbound links,
+    and returns raw items for the validation pipeline.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    extracted_items = []
+    
+    # Crawl pages 1 and 2
+    urls_to_crawl = [
+        "https://awesomefreebies.co.uk/competitions/ending-soon",
+        "https://awesomefreebies.co.uk/competitions/ending-soon?page=2"
+    ]
+
+    for page_url in urls_to_crawl:
+        try:
+            resp = requests.get(page_url, headers=headers, timeout=8)
+            if resp.status_code != 200:
+                continue
+            
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            # Look for outbound/external competition links on the page
+            links = soup.find_all('a', href=True)
+            for link in links:
+                href = link['href']
+                title = link.get_text(strip=True) or "UK Competition Entry"
+                
+                # Filter out navigation/internal links, keeping target competitions
+                if href.startswith("http") and "awesomefreebies.co.uk" not in href:
+                    if len(title) > 5:
+                        extracted_items.append({"title": title, "link": href})
+                elif "/out/" in href or "/redirect/" in href:
+                    full_redirect_url = "https://awesomefreebies.co.uk" + href if href.startswith("/") else href
+                    try:
+                        # Unroll redirect to get real brand URL
+                        head_resp = requests.head(full_redirect_url, headers=headers, allow_redirects=True, timeout=5)
+                        final_dest = head_resp.url
+                        if "awesomefreebies.co.uk" not in final_dest:
+                            extracted_items.append({"title": title, "link": final_dest})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return extracted_items
+
+# --- 7. PARALLEL SCRAPER ENGINE ---
 def process_single_search_result(item):
     title = item.get("title", "UK Competition Entry")
     final_url = item.get("link", "")
@@ -171,7 +218,7 @@ def process_single_search_result(item):
         return {
             "title": title.strip(),
             "url": final_url.strip(),
-            "source": "SerpApi Direct",
+            "source": "Direct Search / Crawler",
             "visibility_score": 100.0,
             "date_added": datetime.date.today().isoformat(),
             "closing_date": date_or_reason
@@ -194,13 +241,6 @@ def fetch_competitions():
         st.error("⚠️ Missing SerpApi Key! Please set SERPAPI_KEY in Streamlit Cloud Secrets.")
         return
 
-    queries = [
-        'site:.co.uk OR site:.com "win" "competition" UK "enter"',
-        'site:.co.uk OR site:.com giveaway "UK residents" "enter"',
-        'inurl:competition OR inurl:competitions UK "win"',
-        'site:instagram.com OR site:facebook.com OR site:twitter.com "uk giveaway" OR "uk competition" "win"'
-    ]
-
     stats = {
         "queries_run": 0,
         "api_errors": 0,
@@ -211,6 +251,19 @@ def fetch_competitions():
     }
 
     raw_items = []
+
+    # A. Direct Directory Scrape
+    af_items = crawl_awesome_freebies()
+    raw_items.extend(af_items)
+
+    # B. SerpApi Search Queries
+    queries = [
+        'site:.co.uk OR site:.com "win" "competition" UK "enter"',
+        'site:.co.uk OR site:.com giveaway "UK residents" "enter"',
+        'inurl:competition OR inurl:competitions UK "win"',
+        'site:instagram.com OR site:facebook.com OR site:twitter.com "uk giveaway" OR "uk competition" "win"'
+    ]
+
     for query in queries:
         stats["queries_run"] += 1
         params = {
@@ -227,12 +280,12 @@ def fetch_competitions():
                 data = resp.json()
                 results = data.get("organic_results", [])
                 raw_items.extend(results)
-                stats["raw_candidates"] += len(results)
             else:
                 stats["api_errors"] += 1
         except Exception:
             stats["api_errors"] += 1
 
+    stats["raw_candidates"] = len(raw_items)
     unique_items = {item.get("link"): item for item in raw_items if item.get("link")}.values()
 
     passed_comps = []
@@ -264,18 +317,18 @@ def fetch_competitions():
 
     st.info(
         f"**Fetch Completed!** Diagnostics:\n"
-        f"- Queries Run: {stats['queries_run']} | API Errors: {stats['api_errors']}\n"
-        f"- Raw Candidates (Past 2 Months): {stats['raw_candidates']}\n"
+        f"- Search Queries Run: {stats['queries_run']} | Directory Crawlers Run: 1\n"
+        f"- Total Raw Candidates Discovered: {stats['raw_candidates']}\n"
         f"- Rejected (Logged for Inspection): {stats['rejected']}\n"
         f"- Passed & Saved to DB: {stats['passed_validation']} (DB Errors: {stats['db_errors']})"
     )
 
-# --- 7. USER INTERFACE ---
+# --- 8. USER INTERFACE ---
 header_col1, header_col2 = st.columns([3, 1])
 
 with header_col1:
     st.title("🏆 UK Live Competition Finder")
-    st.caption("Active giveaways & competitions from web sources and social networks.")
+    st.caption("Active giveaways & competitions from web sources, directories, and social networks.")
 
 with header_col2:
     completed_count = 0
@@ -291,7 +344,7 @@ if not supabase:
     st.warning("⚠️ Database connection missing. Check Streamlit Cloud Settings -> Secrets.")
 else:
     if st.button("🔄 Fetch & Rank Live Competitions Now"):
-        with st.spinner("Searching for live UK competitions from the past 2 months..."):
+        with st.spinner("Searching Google & crawling directories for live UK competitions..."):
             fetch_competitions()
             time.sleep(1)
             st.rerun()
