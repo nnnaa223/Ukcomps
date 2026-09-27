@@ -59,81 +59,82 @@ def extract_closing_date(text):
 
 # --- 5. HARD EXCLUSIONS & FORM-VALIDATION ENGINE ---
 def is_valid_competition_entry(url, title):
+    """
+    Evaluates page structure.
+    Returns: (is_valid: bool, closing_date_or_reason: str)
+    """
     text_lower = title.lower()
     url_lower = url.lower()
 
-    # Reject widget platforms uniformly
+    # Block Widget Platforms
     if any(platform in url_lower for platform in WIDGET_PLATFORM_BLOCKLIST):
-        return False, "Not Specified"
+        return False, "Widget Platform Blocked"
 
-    # A. REJECT TERMS & CONDITIONS / PRIVACY / RULES PAGES
+    # Reject T&Cs / Privacy / Rules
     tc_paths_and_terms = [
         "/terms", "/terms-and-conditions", "/terms-conditions", "/rules", 
         "/t-and-cs", "/tc", "/tcs", "terms & conditions", "terms and conditions",
         "competition rules", "privacy policy", "/privacy", "/legal"
     ]
     if any(tc in url_lower or tc in text_lower for tc in tc_paths_and_terms):
-        return False, "Not Specified"
+        return False, "Terms & Conditions Page"
 
-    # B. REJECT NEWS/ARTICLE URL PATHS
+    # Reject News / Articles
     article_paths = ["/news/", "/article/", "/story/", "/sport/", "/community/", "/features/", "/press-release/", "/awards/"]
     if any(path in url_lower for path in article_paths):
-        return False, "Not Specified"
+        return False, "Article/News URL Path"
 
-    # C. REJECT PAST-TENSE & WINNER ANNOUNCEMENT PATTERNS
+    # Reject Past Winner Stories
     winner_story_terms = [
         r"\bwins\b", r"\bwon\b", r"\bwinner\b", r"\bwinners\b", r"\bawarded\b", 
         r"\bscoops\b", r"\bclaims prize\b", r"\btakes home\b", r"\bcrowned\b", 
         r"\bcelebrates\b", r"\bbags\b", r"\bhanded\b", r"\breceives\b", r"\bcongratulations to\b"
     ]
     if any(re.search(pattern, text_lower) for pattern in winner_story_terms):
-        return False, "Not Specified"
+        return False, "Winner Announcement / Past Tense"
 
-    # D. REJECT PAYWALLS, TICKETING & LEAD-GEN TRAPS
+    # Reject Paywalls & Quote Traps
     paid_or_trap_terms = [
         "ticket required", "buy a ", "entry fee", "per ticket", "raffle ticket", 
         "subscription required", "get a quote", "complete offer", "part 1 of 5", 
         "marketing survey", "insurance quote", "paid entry"
     ]
     if any(trap in text_lower for trap in paid_or_trap_terms):
-        return False, "Not Specified"
+        return False, "Paywall or Lead-Gen Trap"
 
-    # E. MUST CONTAIN ACTIVE ENTRY INTENT
+    # Must contain entry intent in title
     active_intent_terms = ["enter", "win a", "win this", "giveaway", "competition", "free entry", "prize draw"]
     if not any(term in text_lower for term in active_intent_terms):
-        return False, "Not Specified"
+        return False, "Missing Entry Intent in Title"
 
-    # F. SPECIAL HANDLING FOR INSTAGRAM LINKS
+    # Instagram Bypass for Raw HTML Checks
     if "instagram.com" in url_lower:
         return True, "Not Specified"
 
-    # G. LIVE HTTP & HTML FORM INSPECTION
+    # Live HTTP Inspection
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         resp = requests.get(url, headers=headers, timeout=5)
         if resp.status_code != 200:
-            return False, "Not Specified"
+            return False, f"HTTP Error ({resp.status_code})"
         
         soup = BeautifulSoup(resp.text, 'html.parser')
         page_text = soup.get_text().lower()
         
-        # Check widget blocklist against full response text
         if any(platform in resp.text.lower() for platform in WIDGET_PLATFORM_BLOCKLIST):
-            return False, "Not Specified"
+            return False, "Widget Platform in Page HTML"
 
-        # Hard signals that a page is closed
         closed_signals = [
             "competition closed", "giveaway closed", "winner has been contacted", 
             "no longer accepting entries", "giveaway ended", "entries are now closed",
             "this competition has now ended", "sorry, this competition is over", "congratulations to our winner"
         ]
         if any(signal in page_text for signal in closed_signals):
-            return False, "Not Specified"
+            return False, "Competition Closed / Ended"
 
         if any(trap in page_text for trap in ["complete survey to enter", "purchase necessary", "£ per entry"]):
-            return False, "Not Specified"
+            return False, "Survey or Paid Requirement in Body"
 
-        # Validate presence of forms, inputs, or entry instructions
         has_form = bool(soup.find("form"))
         has_input = bool(soup.find("input", {"type": re.compile(r"email|text|submit|radio|checkbox", re.I)}))
         has_entry_phrases = any(phrase in page_text for phrase in [
@@ -142,25 +143,30 @@ def is_valid_competition_entry(url, title):
         ])
 
         if not (has_form or has_input or has_entry_phrases):
-            return False, "Not Specified"
+            return False, "No Form or Entry Instructions Detected"
 
         closing_date = extract_closing_date(page_text)
         return True, closing_date
-    except Exception:
-        return False, "Not Specified"
+    except Exception as e:
+        return False, f"Connection Failed ({type(e).__name__})"
 
-# --- 6. PARALLEL SCRAPER ENGINE (SERPAPI WITH 2-MONTH DATE RESTRICT) ---
+# --- 6. PARALLEL SCRAPER ENGINE ---
 def process_single_search_result(item):
     title = item.get("title", "UK Competition Entry")
     final_url = item.get("link", "")
 
     if not final_url:
-        return None, "rejected"
+        return None, None
 
     if any(social in final_url.lower() for social in ["x.com", "twitter.com", "facebook.com", "tiktok.com"]):
-        return None, "rejected"
+        return None, {
+            "title": title.strip(),
+            "url": final_url.strip(),
+            "reason": "Social Network Blocked (X/FB/TikTok)",
+            "date_added": datetime.date.today().isoformat()
+        }
 
-    is_valid, closing_date = is_valid_competition_entry(final_url, title)
+    is_valid, date_or_reason = is_valid_competition_entry(final_url, title)
     if is_valid:
         return {
             "title": title.strip(),
@@ -168,10 +174,15 @@ def process_single_search_result(item):
             "source": "SerpApi Direct",
             "visibility_score": 100.0,
             "date_added": datetime.date.today().isoformat(),
-            "closing_date": closing_date
-        }, "passed"
-
-    return None, "rejected"
+            "closing_date": date_or_reason
+        }, None
+    else:
+        return None, {
+            "title": title.strip(),
+            "url": final_url.strip(),
+            "reason": date_or_reason,
+            "date_added": datetime.date.today().isoformat()
+        }
 
 def fetch_competitions():
     if not supabase:
@@ -200,7 +211,6 @@ def fetch_competitions():
     }
 
     raw_items = []
-    
     for query in queries:
         stats["queries_run"] += 1
         params = {
@@ -208,7 +218,7 @@ def fetch_competitions():
             "q": query,
             "gl": "gb",
             "hl": "en",
-            "tbs": "qdr:m2",  # Restricts Google search results to past 2 months
+            "tbs": "qdr:m2",
             "api_key": serpapi_key
         }
         try:
@@ -225,27 +235,38 @@ def fetch_competitions():
 
     unique_items = {item.get("link"): item for item in raw_items if item.get("link")}.values()
 
-    new_comps = []
+    passed_comps = []
+    rejected_comps = []
+
     with ThreadPoolExecutor(max_workers=10) as executor:
         results = executor.map(process_single_search_result, unique_items)
-        for comp, status in results:
-            if comp:
-                new_comps.append(comp)
+        for valid_item, rejected_item in results:
+            if valid_item:
+                passed_comps.append(valid_item)
                 stats["passed_validation"] += 1
-            else:
+            elif rejected_item:
+                rejected_comps.append(rejected_item)
                 stats["rejected"] += 1
 
-    for comp in new_comps:
+    # Save passed competitions
+    for comp in passed_comps:
         try:
             supabase.table("competitions").upsert(comp, on_conflict="url").execute()
         except Exception:
             stats["db_errors"] += 1
 
+    # Save rejected items for inspection
+    for rej in rejected_comps:
+        try:
+            supabase.table("rejections").upsert(rej, on_conflict="url").execute()
+        except Exception:
+            pass
+
     st.info(
         f"**Fetch Completed!** Diagnostics:\n"
         f"- Queries Run: {stats['queries_run']} | API Errors: {stats['api_errors']}\n"
         f"- Raw Candidates (Past 2 Months): {stats['raw_candidates']}\n"
-        f"- Rejected (T&Cs / Form / Platform Failure): {stats['rejected']}\n"
+        f"- Rejected (Logged for Inspection): {stats['rejected']}\n"
         f"- Passed & Saved to DB: {stats['passed_validation']} (DB Errors: {stats['db_errors']})"
     )
 
@@ -304,3 +325,37 @@ else:
                     mark_as_dismissed(row['id'])
                     st.rerun()
             st.divider()
+
+    # --- REJECTIONS MANUAL RESCUE UI ---
+    st.write("---")
+    with st.expander("🔍 Inspect Recently Rejected Candidates (Manual Rescue)"):
+        try:
+            rej_response = supabase.table("rejections").select("*").order("id", desc=True).limit(30).execute()
+            rej_data = rej_response.data
+            
+            if not rej_data:
+                st.write("No rejected items logged yet.")
+            else:
+                st.caption("Review items filtered out by your validation engine. If any look legitimate, click Rescue to add them to your active list.")
+                for row in rej_data:
+                    col_a, col_b = st.columns([3, 1])
+                    with col_a:
+                        st.markdown(f"**[{row['title']}]({row['url']})**")
+                        st.caption(f"Reason: `{row['reason']}` | Added: {row['date_added']}")
+                    with col_b:
+                        if st.button("Rescue & Move to Live ↗", key=f"btn_rescue_{row['id']}", use_container_width=True):
+                            # Move to competitions table
+                            supabase.table("competitions").upsert({
+                                "title": row["title"],
+                                "url": row["url"],
+                                "source": "Manual Rescue",
+                                "visibility_score": 100.0,
+                                "date_added": row["date_added"],
+                                "closing_date": "Not Specified"
+                            }, on_conflict="url").execute()
+                            # Delete from rejections
+                            supabase.table("rejections").delete().eq("id", row["id"]).execute()
+                            st.rerun()
+                    st.divider()
+        except Exception as e:
+            st.info("Rejections table not ready yet. Ensure you ran the SQL query in Supabase!")
